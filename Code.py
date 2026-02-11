@@ -1,456 +1,894 @@
-import os
-import sys
+
+# -------------------------------------------------- 1. Full Pipeline: Feature Update + Prediction Tasks --------------------------------------------------
+import re
 import random
+from pathlib import Path
 import warnings
+warnings.simplefilter('ignore')
+
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_distances
 from sklearn.model_selection import StratifiedShuffleSplit
-from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv
+from sklearn.metrics import accuracy_score, roc_curve, auc, roc_auc_score, confusion_matrix
 from lifelines.utils import concordance_index
 
-# Suppress warnings
-warnings.simplefilter('ignore')
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import HeteroConv, SAGEConv, GATConv, global_mean_pool
 
 
-# -------------------------------------------------- 1. Configuration --------------------------------------------------
-@dataclass
-class Config:
-    # Paths
-    working_dir: str = 'Data/'
-    result_root: Path = Path("Results/")
+# -------------------------------------------------- 2. Global Cache & Path Configuration --------------------------------------------------
+# Whether to enable feature update
+ENABLE_FEATURE_UPDATE = True
 
-    # Model Params
-    seed: int = 20250715
-    batch_size: int = 64
-    lr_init: float = 0.001
-    epochs_gnn: int = 10
-    epochs_pred: int = 50
-    hidden_dim: int = 32
-    max_neighbors: int = 20
-    cosine_thres: float = 0.05
-    enable_feature_update: bool = True
+# Result output root directory
+result_root = Path("../Results/")
+result_root.mkdir(parents=True, exist_ok=True)
 
-    # Device
-    device: torch.device = field(default_factory=lambda: torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+epoch_data_dir = result_root / "epoch_metrics"
+epoch_data_dir.mkdir(parents=True, exist_ok=True)
 
-    def __post_init__(self):
-        # Create directories
-        self.feature_update_dir = self.result_root / "Feature_Update_Results"
-        self.prediction_dir = self.result_root / "Survival_Prediction_Results"
-        self.feature_update_dir.mkdir(parents=True, exist_ok=True)
-        self.prediction_dir.mkdir(parents=True, exist_ok=True)
+# Model hyperparameters
+seed = 20250715
+batch_size = 64
+lr_init = 0.001
+epochs = 30
+hidden_dim = 32
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+max_n = 20
+cosine_thres = 0.3
 
-        # Set seeds
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.seed)
-            torch.backends.cudnn.deterministic = True
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
-# Initialize Config
-cfg = Config()
+# -------------------------------------------------- 3. Feature Definitions --------------------------------------------------
+stats = ['ID', 'BCLC A', 'BCLC B', 'BCLC C', 'Age', 'Male', 'HBV', 'HCV']
+
+t_base = ['resection', 'ablation', 'TACE', 'HAIC', 'systemic_treatment']
+fs = ['ViableLesion', 'NewLesion', 'Amount=2/3', 'Amount>3', 'Diameter=50-70', 'Diameter>70',
+      'Metastasis', 'LLNM', 'Varicosity', 'VI', 'AFP=400-800', 'AFP>800', 'CPS=B', 'CPS=C', 'ALBI=2', 'ALBI=3']
+
+f1 = [f'1st_{feat}' for feat in fs[2:]]
+t1 = [f'1st_{t}' for t in t_base]
+t2 = [f'2nd_{t}' for t in t_base]
+
+prefixes = ['2nd', '3rd', '4th', '5th', '6th', '7th', '8th', '9th']
+f2, f3, f4, f5, f6, f7, f8, f9 = [[f"{p}_{feat}" for feat in fs] for p in prefixes]
+
+survival_outcome = ['is_death', 'duration']
+binary_outcome = ['5year-S']
 
 
-# -------------------------------------------------- 2. Data Definitions --------------------------------------------------
-class FeatureDefs:
-    STATS = ['ID', 'BCLC A', 'BCLC B', 'BCLC C', 'Age', 'Male', 'HBV', 'HCV']
-    BASE_FEATURES = ['ViableLesion', 'NewLesion', 'Amount', 'Diameter', 'Metastasis',
-                     'LLNM', 'Varicosity', 'VI', 'AFP', 'CPS', 'ALBI']
+# -------------------------------------------------- 4. Data Processing Functions --------------------------------------------------
+def discrete(data):
+    """Discretize continuous clinical variables into categorical features."""
 
-    # Base treatments for 1st line
-    T1 = ['1st_肝切除', '1st_消融', '1st_栓塞', '1st_灌注', '1st_systemic_treatment']
-    # Base treatments for subsequent lines
-    T2 = ['2nd_肝切除', '2nd_消融', '2nd_栓塞', '2nd_灌注', '2nd_systemic_treatment']
+    # 1. BCLC Stage
+    data['BCLC A'] = data['BCLC'].isin(['Z', 'A']).astype(int)
+    for stage in ['B', 'C', 'D']:
+        data[f'BCLC {stage}'] = (data['BCLC'] == stage).astype(int)
 
-    SURVIVAL_OUTCOME = ['is_death', 'duration']
+    # 2. Process each time-step
+    prefixes = ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th', '9th']
 
-    @staticmethod
-    def get_step_features(prefix: str) -> List[str]:
-        """Dynamically generate feature names for a specific step (e.g., '1st_')"""
-        # Define the logic for specific features like Amount=2/3 etc.
-        # This matches the expanded columns created in DataHandler.discrete
-        expanded = [
-            f'{prefix}Amount=2/3', f'{prefix}Amount>3',
-            f'{prefix}Diameter=50-70', f'{prefix}Diameter>70',
-            f'{prefix}Metastasis', f'{prefix}LLNM', f'{prefix}Varicosity', f'{prefix}VI',
-            f'{prefix}AFP=400-800', f'{prefix}AFP>800',
-            f'{prefix}CPS=B', f'{prefix}CPS=C',
-            f'{prefix}ALBI=2', f'{prefix}ALBI=3'
-        ]
-        if prefix != '1st_':
-            expanded = [f'{prefix}ViableLesion', f'{prefix}NewLesion'] + expanded
-        return expanded
+    for p in prefixes:
+        check_col = f'{p}_Amount' if p == '1st' else f'{p}_ViableLesion'
+        if check_col not in data.columns:
+            continue
 
+        # Amount
+        amt = data[f'{p}_Amount']
+        data[f'{p}_Amount=1'] = (amt <= 1).astype(int)
+        data[f'{p}_Amount=2/3'] = amt.between(1.1, 3).astype(int)
+        data[f'{p}_Amount>3'] = (amt > 3).astype(int)
 
-# -------------------------------------------------- 3. Data Handling --------------------------------------------------
-class DataHandler:
-    @staticmethod
-    def process_duration(data: pd.DataFrame) -> pd.DataFrame:
-        """Calculate duration and age if missing."""
-        if 'duration' not in data.columns:
-            data['first_HCC'] = pd.to_datetime(data['first_HCC'])
-            data['last_followup'] = pd.to_datetime(data['last_followup'])
-            data['duration'] = (data['last_followup'] - data['first_HCC']).dt.days / 30.5
+        # Diameter
+        dia = data[f'{p}_Diameter']
+        data[f'{p}_Diameter<50'] = (dia < 50).astype(int)
+        data[f'{p}_Diameter=50-70'] = dia.between(50, 70).astype(int)
+        data[f'{p}_Diameter>70'] = (dia > 70).astype(int)
 
-        if 'Age' not in data.columns:
-            data['birth_date'] = pd.to_datetime(data['birth_date'])
-            data['Age'] = (data['first_HCC'] - data['birth_date']).dt.days / 365.25
-        return data
+        # AFP
+        afp = data[f'{p}_AFP']
+        data[f'{p}_AFP<400'] = (afp < 400).astype(int)
+        data[f'{p}_AFP=400-800'] = afp.between(400, 800).astype(int)
+        data[f'{p}_AFP>800'] = (afp > 800).astype(int)
 
-    @staticmethod
-    def discretize_features(data: pd.DataFrame) -> pd.DataFrame:
-        """Elegant discretization loop for all time steps."""
-        # Global BCLC
-        for stage in ['A', 'B', 'C']:
-            val = 'Z' if stage == 'A' else stage  # Handle logic for 'Z'/'A' mapping to A
-            if stage == 'A':
-                data['BCLC A'] = data['BCLC'].apply(lambda x: 1 if x in ['Z', 'A'] else 0)
-            else:
-                data[f'BCLC {stage}'] = data['BCLC'].apply(lambda x: 1 if x == stage else 0)
+        # CPS
+        cps = data[f'{p}_CPS']
+        data[f'{p}_CPS=A'] = (cps <= 6).astype(int)
+        data[f'{p}_CPS=B'] = cps.between(6.1, 9).astype(int)
+        data[f'{p}_CPS=C'] = (cps >= 10).astype(int)
 
-        # Dynamic loop for 1st to 9th
-        prefixes = ['1st_', '2nd_', '3rd_', '4th_', '5th_', '6th_', '7th_', '8th_', '9th_']
+        # ALBI
+        albi = data[f'{p}_ALBI']
+        for i in [1, 2, 3]:
+            data[f'{p}_ALBI={i}'] = (albi == i).astype(int)
 
-        for prefix in prefixes:
-            # Check if this step exists in data (e.g., by checking a core column like Amount)
-            col_amount = f"{prefix}Amount"
-            if col_amount not in data.columns:
-                continue
+        # Systemic Treatment
+        target_col = f'{p}_targted_drug'
+        immuno_col = f'{p}_immunodrug'
+        if target_col in data.columns and immuno_col in data.columns:
+            data[f'{p}_systemic_treatment'] = data[[target_col, immuno_col]].max(axis=1)
 
-            # Amount
-            data[f'{prefix}Amount=2/3'] = data[col_amount].apply(lambda x: 1 if 1 < x <= 3 else 0)
-            data[f'{prefix}Amount>3'] = data[col_amount].apply(lambda x: 1 if x > 3 else 0)
-
-            # Diameter
-            col_dia = f"{prefix}Diameter"
-            data[f'{prefix}Diameter=50-70'] = data[col_dia].apply(lambda x: 1 if 50 <= x <= 70 else 0)
-            data[f'{prefix}Diameter>70'] = data[col_dia].apply(lambda x: 1 if x > 70 else 0)
-
-            # AFP
-            col_afp = f"{prefix}AFP"
-            data[f'{prefix}AFP=400-800'] = data[col_afp].apply(lambda x: 1 if 400 <= x <= 800 else 0)
-            data[f'{prefix}AFP>800'] = data[col_afp].apply(lambda x: 1 if x > 800 else 0)
-
-            # CPS
-            col_cps = f"{prefix}CPS"
-            data[f'{prefix}CPS=B'] = data[col_cps].apply(lambda x: 1 if 6 < x <= 9 else 0)
-            data[f'{prefix}CPS=C'] = data[col_cps].apply(lambda x: 1 if x >= 10 else 0)
-
-            # ALBI
-            col_albi = f"{prefix}ALBI"
-            data[f'{prefix}ALBI=2'] = data[col_albi].apply(lambda x: 1 if x == 2 else 0)
-            data[f'{prefix}ALBI=3'] = data[col_albi].apply(lambda x: 1 if x == 3 else 0)
-
-            # Systemic Treatment Combination (if columns exist)
-            target_col = f"{prefix}targted_drug"
-            immuno_col = f"{prefix}immunodrug"
-            if target_col in data.columns and immuno_col in data.columns:
-                data[f'{prefix}systemic_treatment'] = data[[target_col, immuno_col]].max(axis=1)
-
-        return data
-
-    @staticmethod
-    def split_data(df: pd.DataFrame, label_col: str = 'is_death') -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Split into Train (68%), Val (12%), Test (20%)."""
-        y = df[label_col].values
-
-        # 1. Split Test (20%)
-        sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.20, random_state=cfg.seed)
-        trainval_idx, test_idx = next(sss1.split(df, y))
-        trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
-        test_df = df.iloc[test_idx].reset_index(drop=True)
-
-        # 2. Split Val (15% of remaining 80% ≈ 12% total)
-        sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=cfg.seed)
-        train_idx, val_idx = next(sss2.split(trainval_df, trainval_df[label_col]))
-        train_df = trainval_df.iloc[train_idx].reset_index(drop=True)
-        val_df = trainval_df.iloc[val_idx].reset_index(drop=True)
-
-        return train_df, val_df, test_df
+    return data
 
 
-# -------------------------------------------------- 4. Models (GNN & Prediction) --------------------------------------------------
+def select_cols(data):
+    """Select required columns based on available time-step features."""
+    data = data.loc[data['BCLC'] != 'D',].reset_index().drop(['index'], axis=1)
 
-def cox_ph_loss(risk_scores: torch.Tensor, times: torch.Tensor, events: torch.Tensor) -> torch.Tensor:
-    """Standard Cox Partial Likelihood Loss."""
-    # Sort by duration descending
-    order = torch.argsort(times, descending=True)
-    risk_scores = risk_scores[order]
-    events = events[order]
+    # Base columns (always included)
+    base = survival_outcome + binary_outcome + stats + f1 + t1
 
-    exp_risk = torch.exp(risk_scores)
-    cum_exp_risk = torch.cumsum(exp_risk, dim=0)
-    log_cum_risk = torch.log(cum_exp_risk)
+    # Check each stage from highest to lowest
+    stage_check = [
+        ('9th_ViableLesion', f9), ('8th_ViableLesion', f8),
+        ('7th_ViableLesion', f7), ('6th_ViableLesion', f6),
+        ('5th_ViableLesion', f5), ('4th_ViableLesion', f4),
+        ('3rd_ViableLesion', f3),
+    ]
 
-    # Loss only calculated for censored events
-    loss = -torch.sum((risk_scores - log_cum_risk) * events) / (torch.sum(events) + 1e-8)
-    return loss
+    # Collect available feature groups (from high to low stage)
+    available = []
+    for check_col, fgroup in stage_check:
+        if check_col in data.columns:
+            available.append(fgroup)
+
+    # Reverse to get low-to-high order (f3, f4, ..., f9)
+    available = available[::-1]
+
+    # Check f2/t2 stage
+    if '2nd_systemic_treatment' in data.columns:
+        base += f2 + t2
+    elif '2nd_ViableLesion' in data.columns:
+        base += f2
+
+    # Append all available higher-stage features
+    for fg in available:
+        base += fg
+
+    return data[base]
 
 
-class FeatureRefinementGNN(nn.Module):
-    """GNN to refine features based on patient similarity graphs."""
+def data_split(df, label_col):
+    """Split data into train, validation, and test sets."""
+    y_event = df[label_col].values
 
-    def __init__(self, in_channels: int, hidden_channels: int = 32):
+    # Split out 20% as test set, 80% as train+validation
+    sss1 = StratifiedShuffleSplit(n_splits=1, test_size=0.20, random_state=seed)
+    trainval_idx, test_idx = next(sss1.split(df, y_event))
+    trainval_df = df.iloc[trainval_idx].reset_index(drop=True)
+    test_df = df.iloc[test_idx].reset_index(drop=True)
+
+    # Split 15% from train+validation as validation set
+    sss2 = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=seed)
+    train_idx, val_idx = next(sss2.split(trainval_df, trainval_df[label_col]))
+    train_df = trainval_df.iloc[train_idx].reset_index(drop=True)
+    val_df = trainval_df.iloc[val_idx].reset_index(drop=True)
+
+    return train_df, val_df, test_df
+
+
+# -------------------------------------------------- 5. Feature Update Module --------------------------------------------------
+class FeatureUpdateGNN(nn.Module):
+    """GNN model for feature update via graph-based message passing."""
+
+    def __init__(self, in_channels, hidden_channels):
         super().__init__()
         self.conv1 = SAGEConv(in_channels, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, hidden_channels)
         self.decoder = nn.Linear(hidden_channels, in_channels)
-        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.alpha = nn.Parameter(torch.tensor(0.5))  # Residual connection weight
 
     def forward(self, x, edge_index):
-        x_residual = x
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = F.relu(self.conv2(x, edge_index))
+        x_conv = self.conv1(x, edge_index)
+        x_conv = F.relu(x_conv)
+        x_conv = F.dropout(x_conv, p=0.2, training=self.training)
 
-        # Reconstruct features
-        x_updated = self.decoder(x)
+        x_conv = self.conv2(x_conv, edge_index)
+        x_conv = F.relu(x_conv)
 
-        # Residual connection: alpha * new + (1-alpha) * old
-        return self.alpha * x_updated + (1 - self.alpha) * x_residual
+        x_updated = self.decoder(x_conv)
+        x_final = self.alpha * x_updated + (1 - self.alpha) * x  # Residual connection
 
-
-class SurvivalPredictor(nn.Module):
-    """DeepSurv-like MLP for risk prediction."""
-
-    def __init__(self, in_features: int, hidden_dim: int = 32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1)  # Single risk score output
-        )
-
-    def forward(self, x):
-        return self.net(x)
+        return x_final
 
 
-# -------------------------------------------------- 5. Core Engine --------------------------------------------------
+def cox_ph_loss(risk_scores, durations, events, eps=1e-8):
+    """
+    Numerically stable Cox Proportional Hazards loss.
+    Prevents NaNs by clamping risk scores and adding epsilon.
+    """
+    risk_scores = torch.clamp(risk_scores, min=-20, max=20)
+    exp_risk = torch.exp(risk_scores)
 
-class GNNGraphBuilder:
-    def __init__(self):
-        self.neighbor_cache = {}
+    # Sort by duration descending for efficient risk set calculation
+    indices = torch.argsort(durations, descending=True)
+    exp_risk = exp_risk[indices]
+    events = events[indices]
 
-    def build(self, df: pd.DataFrame, feature_cols: List[str]) -> Tuple[Data, StandardScaler]:
-        """Builds a graph where edges connect similar patients."""
-        X = df[feature_cols].values
+    # Cumulative sum of risk (from longest to shortest duration)
+    risk_set_sum = torch.cumsum(exp_risk, dim=0) + eps
 
-        # Standardize for distance calculation
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-
-        # Compute Cosine Distance
-        dist_matrix = cosine_distances(X_scaled)
-        np.fill_diagonal(dist_matrix, 2.0)  # Ignore self
-
-        edges = set()
-        n_samples = len(df)
-
-        # Create edges
-        for i in range(n_samples):
-            # Find neighbors within threshold
-            candidates = np.where(dist_matrix[i] < cfg.cosine_thres)[0]
-            # Sort by similarity (distance)
-            sorted_idx = np.argsort(dist_matrix[i][candidates])
-            closest = candidates[sorted_idx][:cfg.max_neighbors]
-
-            for j in closest:
-                if i < j:  # Undirected
-                    edges.add((i, j))
-                    edges.add((j, i))
-
-        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous() if edges else torch.empty((2, 0),
-                                                                                                            dtype=torch.long)
-
-        data = Data(
-            x=torch.tensor(X_scaled, dtype=torch.float),  # Use scaled data for GNN input
-            edge_index=edge_index,
-            y_event=torch.tensor(df['is_death'].values, dtype=torch.float),
-            y_duration=torch.tensor(df['duration'].values, dtype=torch.float)
-        )
-
-        return data, scaler
+    # Negative log partial likelihood (only for uncensored events)
+    log_loss = torch.log(risk_set_sum) - risk_scores[indices]
+    return torch.sum(log_loss * events) / (torch.sum(events) + eps)
 
 
-class PipelineEngine:
-    def __init__(self):
-        self.graph_builder = GNNGraphBuilder()
+def build_node_graph(df, neighbor_vectors, cosine_threshold=0.5, max_neighbors=20, task_name=None):
+    """Build a node-level homogeneous graph for feature update based on cosine similarity."""
+    global neighbor_cache
 
-    def run_gnn_update(self, df: pd.DataFrame, features: List[str], dataset_type: str,
-                       model: Optional[nn.Module] = None):
-        """Runs the GNN feature update step."""
-        if not cfg.enable_feature_update:
-            return df, None
+    n_samples = len(df)
 
-        data, scaler = self.graph_builder.build(df, features)
-        data = data.to(cfg.device)
+    # Extract and standardize neighbor computation vectors
+    X_neighbor = df[neighbor_vectors].values
+    X_neighbor = StandardScaler().fit_transform(X_neighbor)
 
-        # Initialize or use existing model
-        if model is None:
-            model = FeatureRefinementGNN(len(features), cfg.hidden_dim).to(cfg.device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr_init)
+    # Compute cosine distance matrix
+    cosine_dist_matrix = cosine_distances(X_neighbor)
+    print(f"Neighbor vector shape: {X_neighbor.shape}")
+    print(f"Cosine distance range: [{cosine_dist_matrix.min():.4f}, {cosine_dist_matrix.max():.4f}]")
 
-            # Train GNN (Self-supervised using Cox Loss on risk features)
-            model.train()
-            for _ in range(cfg.epochs_gnn):
-                optimizer.zero_grad()
-                updated_feats = model(data.x, data.edge_index)
-                # Simple proxy loss: minimize cox loss of the updated features averaged
-                risk = torch.mean(updated_feats, dim=1)
-                loss = cox_ph_loss(risk, data.y_duration, data.y_event)
-                loss.backward()
-                optimizer.step()
+    # Exclude self-connections
+    np.fill_diagonal(cosine_dist_matrix, 2.0)
 
-        # Inference
-        model.eval()
-        with torch.no_grad():
-            updated_x_scaled = model(data.x, data.edge_index).cpu().numpy()
+    # Build edge index
+    edges = set()
+    neighbor_counts = []
 
-        # Inverse transform to get original scale back
-        updated_x = scaler.inverse_transform(updated_x_scaled)
+    for i in range(n_samples):
+        candidate_neighbors = np.where(cosine_dist_matrix[i] < cosine_threshold)[0]
+        candidate_distances = cosine_dist_matrix[i][candidate_neighbors]
+        sorted_indices = np.argsort(candidate_distances)
+        sorted_neighbors = candidate_neighbors[sorted_indices]
+        selected_neighbors = sorted_neighbors[:max_neighbors]
+        neighbor_counts.append(len(selected_neighbors))
 
-        # Create new DataFrame
-        new_df = df.copy()
-        new_df[features] = updated_x
+        # Add undirected edges
+        for j in selected_neighbors:
+            if i < j:
+                edges.add((i, j))
+                edges.add((j, i))
 
-        return new_df, model
+    # Convert to PyTorch Geometric format
+    edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
 
-    def run_survival_prediction(self, train_df, val_df, test_df, features, task_name):
-        """Runs the downstream survival prediction task."""
+    # Prepare labels
+    y_is_death = torch.tensor(df['is_death'].values, dtype=torch.float)
+    y_duration = torch.tensor(df['duration'].values, dtype=torch.float)
+    y_5year = torch.tensor(df['5year-S'].values, dtype=torch.float)
 
-        def get_tensors(d):
-            return (torch.tensor(d[features].values, dtype=torch.float).to(cfg.device),
-                    torch.tensor(d['duration'].values, dtype=torch.float).to(cfg.device),
-                    torch.tensor(d['is_death'].values, dtype=torch.float).to(cfg.device))
+    data = Data(
+        x=torch.tensor(X_neighbor, dtype=torch.float),
+        edge_index=edge_index,
+        y_is_death=y_is_death,
+        y_duration=y_duration,
+        y_5year=y_5year
+    )
 
-        X_tr, T_tr, E_tr = get_tensors(train_df)
-        X_val, T_val, E_val = get_tensors(val_df)
-        X_te, T_te, E_te = get_tensors(test_df)
+    return data, cosine_dist_matrix, neighbor_counts
 
-        model = SurvivalPredictor(len(features)).to(cfg.device)
-        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr_init)
 
-        # Training
-        best_c_index = 0
-        best_state = None
+def update_features_with_gnn(df, neighbor_vectors, update_features, task_name,
+                             model=None, scaler=None, cosine_threshold=0.5,
+                             max_neighbors=20, train_model=True, dataset_name="train"):
+    """Update patient features using GNN-based graph message passing."""
 
-        for epoch in range(cfg.epochs_pred):
-            model.train()
-            opt.zero_grad()
-            risk = model(X_tr)
-            loss = cox_ph_loss(risk, T_tr, E_tr)
+    if not ENABLE_FEATURE_UPDATE:
+        return _handle_disabled_update(df, neighbor_vectors, update_features)
+
+    # Setup Graph
+    graph_data, *_ = build_node_graph(df, neighbor_vectors, cosine_threshold, max_neighbors, task_name)
+
+    if len(df) != graph_data.x.size(0):
+        raise ValueError(f"Mismatch: {len(df)} rows vs {graph_data.x.size(0)} nodes.")
+
+    # Scaling
+    scaler = scaler or StandardScaler().fit(df[neighbor_vectors].values)
+    graph_data.x = torch.from_numpy(scaler.transform(df[neighbor_vectors].values)).float()
+
+    # Model initialization
+    model = (model or FeatureUpdateGNN(len(neighbor_vectors), 64)).to(device)
+
+    # Track training health
+    is_healthy = True
+    if train_model:
+        print(f"🚀 Training {dataset_name} features...")
+        is_healthy = _train_feature_model(model, graph_data.to(device), task_name)
+
+    # Inference
+    model.eval()
+    model.cpu()
+    with torch.no_grad():
+        out = model(graph_data.cpu().x, graph_data.cpu().edge_index).numpy()
+        updated_values = scaler.inverse_transform(out)
+
+    # Map updated features back to DataFrame
+    updated_df = df.copy()
+    feat_map = {feat: i for i, feat in enumerate(neighbor_vectors)}
+    for feat in filter(lambda f: f in feat_map, update_features):
+        updated_df[feat] = updated_values[:, feat_map[feat]]
+
+    return updated_df, graph_data, model, scaler, is_healthy
+
+
+def _handle_disabled_update(df, neighbor_vectors, update_features):
+    """Pass-through handler when feature update is disabled."""
+    print("⏩ Feature update disabled. Using raw data.")
+    mock_graph = Data(
+        x=torch.from_numpy(df[neighbor_vectors].values).float(),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        **{f'y_{k}': torch.from_numpy(df[v].values).float()
+           for k, v in [('is_death', 'is_death'), ('duration', 'duration'), ('5year', '5year-S')]}
+    )
+    return df.copy(), mock_graph, None, None, True  # True = healthy
+
+
+def _train_feature_model(model, data, task_name, epochs=10, patience=5):
+    """Train the feature update GNN with early stopping."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    best_loss, best_state, counter = float('inf'), None, 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        optimizer.zero_grad()
+        try:
+            out = model(data.x, data.edge_index)
+            loss = cox_ph_loss(out.mean(dim=1), data.y_duration, data.y_is_death)
+
+            if torch.isnan(loss): raise ValueError("NaN Loss")
+
             loss.backward()
-            opt.step()
+            optimizer.step()
 
-            # Validation
-            model.eval()
-            with torch.no_grad():
-                val_risk = model(X_val)
-                try:
-                    val_c = concordance_index(T_val.cpu(), -val_risk.cpu(), E_val.cpu())
-                except:
-                    val_c = 0.5
+            if loss.item() < best_loss:
+                best_loss, counter = loss.item(), 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                counter += 1
+            if counter >= patience: break
 
-                if val_c > best_c_index:
-                    best_c_index = val_c
-                    best_state = model.state_dict()
+        except (ValueError, RuntimeError):
+            print(f"⚠️ NaN detected in {task_name}. Rolling back to best state.")
+            if best_state:
+                model.load_state_dict(best_state)
+            else:
+                _load_last_valid_from_disk(model, task_name)
+            return False  # Interrupted
 
-        # Testing
-        if best_state:
-            model.load_state_dict(best_state)
-
-        model.eval()
-        with torch.no_grad():
-            test_risk = model(X_te)
-            c_index = concordance_index(T_te.cpu(), -test_risk.cpu(), E_te.cpu())
-
-        print(f"Task [{task_name}] Completed. Test C-Index: {c_index:.4f}")
-        return c_index
+    return True  # Completed normally
 
 
-# -------------------------------------------------- 6. Main Execution --------------------------------------------------
+def _load_last_valid_from_disk(model, task_name):
+    """Fallback: load last valid weights from disk if in-memory state is lost."""
+    path = epoch_data_dir / f"{task_name}_last_valid_weights.pth"
+    if path.exists():
+        model.load_state_dict(torch.load(path))
+
+
+# -------------------------------------------------- 6. Prediction Task Module --------------------------------------------------
+class GNN_Survival(nn.Module):
+    """Heterogeneous GNN model for survival analysis with GAT-based attention."""
+
+    def __init__(self, sample, hidden=128, heads=8):
+        super().__init__()
+        # Linear projection per node type
+        self.lin = nn.ModuleDict({
+            nt: nn.Linear(sample[nt].num_features, hidden)
+            for nt in sample.node_types
+        })
+
+        # Attention-based heterogeneous graph convolution (self-loops disabled)
+        self.conv1 = HeteroConv({
+            et: GATConv(
+                (-1, -1),
+                hidden,
+                heads=heads,
+                concat=False,
+                add_self_loops=False
+            )
+            for et in sample.edge_types
+        }, aggr='mean')
+
+        self.conv2 = HeteroConv({
+            et: GATConv(
+                (-1, -1),
+                hidden,
+                heads=heads,
+                concat=False,
+                add_self_loops=False
+            )
+            for et in sample.edge_types
+        }, aggr='mean')
+
+        # Output layer
+        self.fc = nn.Linear(hidden * len(sample.node_types), 1)
+
+    def forward(self, data):
+        x = {nt: F.relu(self.lin[nt](data[nt].x)) for nt in data.node_types}
+        x = self.conv1(x, data.edge_index_dict)
+        x = {k: F.relu(v) for k, v in x.items()}
+        x = self.conv2(x, data.edge_index_dict)
+
+        pooled = [global_mean_pool(x[nt], data[nt].batch) for nt in data.node_types]
+        g_emb = torch.cat(pooled, dim=1)
+        return self.fc(g_emb).squeeze(-1)
+
+
+def ci_with_ci(risk, time, event, n_boot=1000):
+    """Compute C-index with bootstrap 95% confidence interval."""
+    ci = concordance_index(time, -risk, event)
+    idx = np.arange(len(risk))
+    boot = []
+    for _ in range(n_boot):
+        samp = np.random.choice(idx, size=len(idx), replace=True)
+        if len(np.unique(event[samp])) < 2:
+            continue
+        boot.append(concordance_index(time[samp], -risk[samp], event[samp]))
+    if len(boot) >= 10:
+        lo, hi = np.percentile(boot, [2.5, 97.5])
+    else:
+        lo, hi = ci, ci
+    return ci, lo, hi
+
+
+def evaluate_Cindex(loader, model, df=None, task_name=None):
+    """Evaluate model on a data loader and return C-index with confidence interval."""
+    model.eval()
+    risks, times, events = [], [], []
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            risks.append(model(batch).cpu())
+            times.append(batch.y_time.cpu())
+            events.append(batch.y_event.cpu())
+
+    risk = torch.cat(risks).numpy()
+    time = torch.cat(times).numpy()
+    event = torch.cat(events).numpy()
+
+    # Check for NaN values
+    if np.isnan(risk).any() or np.isnan(time).any() or np.isnan(event).any():
+        nan_risk = np.isnan(risk).sum()
+        nan_time = np.isnan(time).sum()
+        raise ValueError(f"NaNs detected in inputs. Risk NaN: {nan_risk}, Time NaN: {nan_time}")
+
+    # Compute C-index with confidence interval
+    ci, lo, hi = ci_with_ci(risk, time, event)
+
+    if df is not None:
+        result_df = df.copy()
+        result_df['survival_risk'] = risk
+        return (ci, lo, hi), result_df, time, event
+
+    return (ci, lo, hi), risk
+
+
+def train_survival_model(train_loader, val_loader, test_loader,
+                         train_df, val_df, test_df,
+                         sample_graph, task_name, original_features):
+    """Train the survival analysis GNN model with early stopping and best-model checkpointing."""
+    print(f"Starting survival model training: {task_name}")
+
+    # Ensure task directory exists for saving .pt files
+    task_dir = epoch_data_dir / task_name
+    task_dir.mkdir(exist_ok=True)
+
+    # 1. Initialize result state (safe fallback values)
+    state = {
+        'ci': (0.5, 0.5, 0.5),
+        'dfs': [train_df.copy(), val_df.copy(), test_df.copy()],
+        'risks': [np.zeros(len(train_df)), np.zeros(len(val_df)), np.zeros(len(test_df))],
+        'best_val_ci': 0.0,
+        'patience': 0,
+        'metrics_history': []
+    }
+
+    # 2. Component initialization
+    try:
+        model = GNN_Survival(sample_graph, hidden=hidden_dim).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr_init, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3, min_lr=0.001
+        )
+    except Exception as e:
+        print(f"Component initialization failed: {e}")
+        return state['ci'], *state['dfs'], *state['risks']
+
+    # 3. Inner training closure
+    def run_epoch():
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            risk = model(batch)
+
+            if torch.isnan(risk).any(): raise ValueError("NaN risk detected")
+            loss = cox_ph_loss(risk, batch.y_time, batch.y_event)
+            if torch.isnan(loss): raise ValueError("NaN loss detected")
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        return total_loss
+
+    # 4. Main training loop
+    print(f"\nTraining started: {task_name}")
+    try:
+        for epoch in range(1, epochs + 1):
+            # A. Training step
+            loss = run_epoch()
+            scheduler.step(loss)
+
+            # B. Evaluation step
+            tr_ci, _ = evaluate_Cindex(train_loader, model)
+            val_ci, _ = evaluate_Cindex(val_loader, model)
+            te_ci, _ = evaluate_Cindex(test_loader, model)
+
+            # Log metrics
+            state['metrics_history'].append({'epoch': epoch, 'loss': loss, 'val_ci': val_ci[0]})
+            print(
+                f'Epoch {epoch:03d} | Loss {loss:.3f} | Train CI {tr_ci[0]:.3f} | Val CI {val_ci[0]:.3f} | Test CI {te_ci[0]:.3f}')
+
+            # C. Validation improvement check
+            is_first_valid = (epoch == 1 and not np.isnan(val_ci[0]))
+            is_improvement = (val_ci[0] > state['best_val_ci'])
+
+            if is_first_valid or is_improvement:
+                state['best_val_ci'] = val_ci[0]
+                state['best_epoch'] = epoch
+                state['patience'] = 0
+
+                # Save best model weights
+                torch.save(model.state_dict(), task_dir / f'best_survival_{task_name}.pt')
+
+                # Capture evaluation data
+                _, tr_res, _, _ = evaluate_Cindex(train_loader, model, train_df)
+                _, va_res, _, _ = evaluate_Cindex(val_loader, model, val_df)
+                _, te_res, _, _ = evaluate_Cindex(test_loader, model, test_df)
+
+                state.update({
+                    'tr_ci': tr_ci[0], 'tr_lo': tr_ci[1], 'tr_hi': tr_ci[2],
+                    'val_ci': val_ci[0], 'val_lo': val_ci[1], 'val_hi': val_ci[2],
+                    'te_ci': te_ci[0], 'te_lo': te_ci[1], 'te_hi': te_ci[2],
+                    'train_surv_df': tr_res,
+                    'val_surv_df': va_res,
+                    'test_surv_df': te_res
+                })
+                print(
+                    f"  >>> {'Baseline' if is_first_valid else 'Improvement'} captured at Epoch {epoch}: Val CI {val_ci[0]:.3f}")
+            else:
+                state['patience'] += 1
+                if state['patience'] >= 5:
+                    print("Early stopping triggered")
+                    break
+    except Exception as e:
+        print(f"\nTraining interrupted (task: {task_name}): {e}")
+        best_path = task_dir / f'best_survival_{task_name}.pt'
+        if best_path.exists():
+            model.load_state_dict(torch.load(best_path))
+
+        save_final_results(task_name, state, state['metrics_history'], is_error=True)
+    else:
+        save_final_results(task_name, state, state['metrics_history'], is_error=False)
+
+    # Update final C-index (fix: state['ci'] was stuck at default 0.5)
+    if 'te_ci' in state:
+        state['ci'] = (state['te_ci'], state['te_lo'], state['te_hi'])
+
+    # 5. Return (strictly matching expected format)
+    return *state['ci'], *state['dfs'], *state['risks']
+
+
+def save_final_results(task_name, best_results, epoch_metrics, is_error):
+    """Save final results: best C-index (with 95% CI) and per-epoch training history."""
+    task_dir = epoch_data_dir / task_name
+    task_dir.mkdir(exist_ok=True)
+
+    # 1. Save best C-index results (with 95% CI)
+    best_ci_results = pd.DataFrame({
+        'Dataset': ['train', 'validation', 'test'],
+        'Cindex': [
+            best_results.get('tr_ci', np.nan),
+            best_results.get('val_ci', np.nan),
+            best_results.get('te_ci', np.nan)
+        ],
+        '95%CI_lower': [
+            best_results.get('tr_lo', np.nan),
+            best_results.get('val_lo', np.nan),
+            best_results.get('te_lo', np.nan)
+        ],
+        '95%CI_upper': [
+            best_results.get('tr_hi', np.nan),
+            best_results.get('val_hi', np.nan),
+            best_results.get('te_hi', np.nan)
+        ],
+        'Best_Epoch': best_results.get('best_epoch', np.nan)
+    })
+
+    status = "error_last_valid" if is_error else "final_best"
+    best_ci_results.to_excel(
+        task_dir / f"{task_name}_best_cindex_{status}.xlsx",
+        index=False
+    )
+
+    # 2. Save C-index epoch history
+    epoch_metrics_df = pd.DataFrame(epoch_metrics)
+    epoch_metrics_df.to_excel(
+        task_dir / f"{task_name}_cindex_epoch_history_{status}.xlsx",
+        index=False
+    )
+
+    # 3. Save survival risk scores (if available)
+    if best_results.get('train_surv_df') is not None:
+        best_results['train_surv_df'].to_csv(
+            task_dir / f"{task_name}_train_survival_risk_{status}.csv",
+            index=False
+        )
+        best_results['val_surv_df'].to_csv(
+            task_dir / f"{task_name}_val_survival_risk_{status}.csv",
+            index=False
+        )
+        best_results['test_surv_df'].to_csv(
+            task_dir / f"{task_name}_test_survival_risk_{status}.csv",
+            index=False
+        )
+
+    print(f"Results saved to: {task_dir}")
+
+
+def get_graph_config(feature_type):
+    """
+    Return the (node_list, edge_list) for the heterogeneous graph topology
+    corresponding to the given feature_type string.
+    """
+    nodes = []
+    edges = []
+
+    def add_bi_edge(src, dst):
+        edges.append((src, dst))
+
+    # --- Phase 1: Core layer (f1, t1, f2, t2) ---
+    if feature_type.startswith('f1t1'):
+        nodes.extend(['f1', 't1'])
+        add_bi_edge('f1', 't1')
+
+    if 'f2' in feature_type:
+        nodes.append('f2')
+        nodes.append('t2')
+        add_bi_edge('f1', 'f2')
+        add_bi_edge('t1', 'f2')
+        add_bi_edge('t1', 't2')
+        add_bi_edge('f2', 't2')
+
+    # --- Phase 2: Bridge layer (f3) ---
+    if 'f3' in feature_type:
+        nodes.append('f3')
+        add_bi_edge('f2', 'f3')
+        add_bi_edge('t2', 'f3')
+
+    # --- Phase 3: Linear tail (f4 to f9) ---
+    tail_match = re.search(r'f3(\d+)', feature_type)
+    if tail_match:
+        tail_nums = tail_match.group(1)
+        current_prev = 'f3'
+        for num_char in tail_nums:
+            curr_node = f'f{num_char}'
+            nodes.append(curr_node)
+            add_bi_edge(current_prev, curr_node)
+            current_prev = curr_node
+
+    return nodes, edges
+
+
+def build_hetero_graph(row, nodes, edges, col_map):
+    """Build a single-sample heterogeneous graph from one data row."""
+    d = HeteroData()
+
+    # 1. Build node features dynamically
+    for node_name in nodes:
+        if node_name not in col_map:
+            raise ValueError(f"Missing node in column map: {node_name}")
+
+        col_var = col_map[node_name]
+        vals = row[col_var].values.astype(np.float32)
+        d[node_name].x = torch.from_numpy(vals).unsqueeze(0)
+
+    # 2. Build edges (bidirectional)
+    ei = torch.tensor([[0], [0]], dtype=torch.long)
+
+    for src, dst in edges:
+        d[src, 'to', dst].edge_index = ei
+        d[dst, 'to', src].edge_index = ei
+
+    # 3. Set labels
+    d.y = torch.tensor(int(row['5year-S']), dtype=torch.long).unsqueeze(0)
+    d.y_event = torch.tensor(int(row['is_death']), dtype=torch.float)
+    d.y_time = torch.tensor(float(row['duration']), dtype=torch.float)
+
+    return d
+
+
+def call_build_hetero_graph(train_df, val_df, test_df, feature_type):
+    """Entry point for building heterogeneous graph datasets and data loaders."""
+    col_map = {
+        'f1': f1, 't1': t1,
+        'f2': f2, 't2': t2,
+        'f3': f3, 'f4': f4, 'f5': f5,
+        'f6': f6, 'f7': f7, 'f8': f8, 'f9': f9
+    }
+
+    try:
+        nodes, edges = get_graph_config(feature_type)
+    except Exception as e:
+        raise ValueError(f"Failed to parse feature type {feature_type}: {str(e)}")
+
+    print(f"Building graphs for [{feature_type}]")
+    print(f"Active Nodes: {nodes}")
+    print(f"Active Edges (bidirectional): {edges}")
+
+    build_fn = lambda r: build_hetero_graph(r, nodes, edges, col_map)
+
+    train_graphs = [build_fn(r) for _, r in train_df.iterrows()]
+    val_graphs = [build_fn(r) for _, r in val_df.iterrows()]
+    test_graphs = [build_fn(r) for _, r in test_df.iterrows()]
+
+    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_graphs, batch_size=batch_size)
+    test_loader = DataLoader(test_graphs, batch_size=batch_size)
+
+    return train_loader, val_loader, test_loader, train_graphs
+
+
+def run_task(feature_type, data_path, neighbor_vectors, update_features,
+             update_model=None,
+             prev_train_ids=None, prev_val_ids=None, prev_test_ids=None):
+    """
+    Execute a single task: feature update + survival model training + evaluation.
+    Accepts optional previous split IDs to maintain consistent data splits across tasks.
+    """
+    print(f"\n{'=' * 20} Task: {feature_type} {'=' * 20}")
+
+    # 1. Pack legacy IDs
+    prev_ids = None
+    if prev_train_ids is not None:
+        prev_ids = {
+            'train': prev_train_ids,
+            'val': prev_val_ids,
+            'test': prev_test_ids
+        }
+
+    df = pd.read_excel(data_path)
+    df = discrete(df)
+    df = select_cols(df)
+
+    # 2. Data splitting
+    splits = {}
+    if prev_ids is None:
+        tr, va, te = data_split(df, '5year-S')
+        splits = {'train': tr, 'val': va, 'test': te}
+    else:
+        for key, saved_ids in prev_ids.items():
+            splits[key] = df[df['ID'].isin(saved_ids)].copy()
+            if len(splits[key]) < 3:
+                raise ValueError(f"Split '{key}' is too small (n={len(splits[key])}). Check ID overlap.")
+
+    # 3. Feature update loop
+    updated_splits, scaler = {}, None
+    task_is_healthy = True
+
+    if ENABLE_FEATURE_UPDATE:
+        for name in ['train', 'val', 'test']:
+            is_train = (name == 'train')
+            res, _, model_ptr, scaler_ptr, healthy_flag = update_features_with_gnn(
+                splits[name], neighbor_vectors, update_features, feature_type,
+                model=update_model,
+                scaler=scaler if not is_train else None,
+                train_model=(update_model is None and is_train),
+                dataset_name=name
+            )
+            updated_splits[name] = res
+            if not healthy_flag: task_is_healthy = False
+            if is_train: update_model, scaler = model_ptr, scaler_ptr
+    else:
+        updated_splits = {k: v.copy() for k, v in splits.items()}
+
+    # 4. Survival analysis
+    loaders = call_build_hetero_graph(*[updated_splits[k] for k in ['train', 'val', 'test']], feature_type)
+
+    surv_results = train_survival_model(
+        *loaders[:3],
+        *[updated_splits[k] for k in ['train', 'val', 'test']],
+        loaders[3][0],
+        feature_type, update_features
+    )
+    te_ci, te_lo, te_hi, _, _, _, tr_risk, va_risk, te_risk = surv_results
+
+    # 5. Build result summary
+    display_name = feature_type if task_is_healthy else f"{feature_type}_best_cindex_error_last_valid"
+
+    summary = {
+        "Task": display_name,
+        "Survival_Cindex": f"{te_ci:.3f} ({te_lo:.3f}-{te_hi:.3f})",
+        **{f"{k}_n": len(v) for k, v in updated_splits.items()}
+    }
+
+    current_train_ids = set(updated_splits['train']['ID'])
+    current_val_ids = set(updated_splits['val']['ID'])
+    current_test_ids = set(updated_splits['test']['ID'])
+
+    return summary, update_model, current_train_ids, current_val_ids, current_test_ids
+
 
 def main():
-    if not os.path.exists(cfg.working_dir):
-        print("Working directory not found. Please check paths.")
-        return
+    """Main function: iterate through all feature configurations and train survival models."""
+    print(f"Device: {device} | Mode: Sequential task execution")
 
-    os.chdir(cfg.working_dir)
-    # Load Data (Replace with your actual file name)
-    try:
-        raw_df = pd.read_excel("f1t1f2t220250715.xlsx")
-    except FileNotFoundError:
-        print("Data file not found.")
-        return
+    # 1. Configuration
+    f_list = [f1, f2, f3, f4, f5, f6, f7, f8, f9]
+    filenames = [
+        "f1t1.xlsx", "f1t1f2t2.xlsx", "f1t1f2t2f3.xlsx",
+        "f1t1f2t2f34.xlsx", "f1t1f2t2f345.xlsx", "f1t1f2t2f3456.xlsx",
+        "f1t1f2t2f34567.xlsx", "f1t1f2t2f345678.xlsx", "f1t1f2t2f3456789.xlsx"
+    ]
 
-    # Preprocess
-    print("Preprocessing data...")
-    df = DataHandler.process_duration(raw_df)
-    df = DataHandler.discretize_features(df)
+    # 2. Dynamically generate all tasks
+    all_tasks = []
+    for i in range(len(filenames)):
+        current_features = sum(f_list[:i + 1], [])
+        all_tasks.append({
+            "feature_type": filenames[i].replace(".xlsx", ""),
+            "data_path": filenames[i],
+            "neighbor_vectors": current_features,
+            "update_features": current_features
+        })
 
-    # Define tasks (Features required for each phase)
-    # This logic replicates the expanding window of features (Base -> Base+T1 -> Base+T1+F2...)
-    tasks = []
+    # 3. Execute tasks
+    tasks = all_tasks
 
-    # Base Features (F1)
-    f1_cols = FeatureDefs.get_step_features('1st_')
-    tasks.append(("Phase1_Base", FeatureDefs.STATS + f1_cols))
+    shared_ids = {'prev_train_ids': None, 'prev_val_ids': None, 'prev_test_ids': None}
+    all_results = []
 
-    # Treatment 1 (F1 + T1)
-    tasks.append(("Phase2_Treatment1", FeatureDefs.STATS + f1_cols + FeatureDefs.T1))
+    for i, task in enumerate(tasks):
+        print(f"\n{'#' * 30} Running task {i + 1}/{len(tasks)}: {task['feature_type']} {'#' * 30}")
 
-    # Follow-up (F1 + T1 + F2)
-    f2_cols = FeatureDefs.get_step_features('2nd_')
-    tasks.append(("Phase3_FollowUp1", FeatureDefs.STATS + f1_cols + FeatureDefs.T1 + f2_cols))
+        try:
+            # Each task creates its own model (dimensions vary across tasks)
+            result, _, *new_ids = run_task(
+                **task,
+                **shared_ids,
+                update_model=None
+            )
+            all_results.append(result)
 
-    # Engine
-    engine = PipelineEngine()
-    results = []
+            # Lock data splits after the first task
+            if i == 0:
+                shared_ids = {
+                    'prev_train_ids': new_ids[0],
+                    'prev_val_ids': new_ids[1],
+                    'prev_test_ids': new_ids[2]
+                }
 
-    for task_name, feat_cols in tasks:
-        # Check availability
-        valid_cols = [c for c in feat_cols if c in df.columns]
-        curr_df = df[FeatureDefs.SURVIVAL_OUTCOME + valid_cols].dropna()
+        except Exception as e:
+            print(f"❌ Task {task['feature_type']} failed: {e}")
+            all_results.append({"Task": task["feature_type"], "Status": "Failed", "Error": str(e)})
+            continue
 
-        # Split
-        train, val, test = DataHandler.split_data(curr_df)
-
-        # Update Features (GNN)
-        gnn_cols = [c for c in valid_cols if c not in FeatureDefs.STATS]  # Only update numerical/categorical features
-
-        print(f"\n--- Running Task: {task_name} ---")
-        train_upd, model = engine.run_gnn_update(train, gnn_cols, "train")
-        val_upd, _ = engine.run_gnn_update(val, gnn_cols, "val", model)
-        test_upd, _ = engine.run_gnn_update(test, gnn_cols, "test", model)
-
-        # Save Updated Features
-        save_path = cfg.feature_update_dir / f"{task_name}_test_features.xlsx"
-        test_upd.to_excel(save_path, index=False)
-
-        # Predict Survival
-        c_idx = engine.run_survival_prediction(train_upd, val_upd, test_upd, gnn_cols, task_name)
-
-        results.append({'Task': task_name, 'C-Index': c_idx})
-
-    # Save Final Results
-    res_df = pd.DataFrame(results)
-    res_df.to_excel(cfg.result_root / "Final_Survival_Metrics.xlsx", index=False)
-    print("\nPipeline Finished Successfully.")
+    # Save summary
+    pd.DataFrame(all_results).to_excel(result_root / "results_summary.xlsx", index=False)
 
 
 if __name__ == "__main__":
