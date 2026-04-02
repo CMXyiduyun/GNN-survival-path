@@ -1,4 +1,4 @@
-# GNN-SP (Graph Neural Network for Survival Prediction)
+# GNN-SP (Graph Neural Network for Survival Path)
 
 This repository contains the code for the GNN-SP pipeline, a Heterogeneous Graph Neural Network approach for survival analysis and prediction, which includes a feature update module via graph-based message passing and a prediction task module.
 
